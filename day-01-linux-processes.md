@@ -51,14 +51,15 @@ At the foundation of operating systems lies a critical distinction between stati
 ```
 
 ### The Program: Static Inanimate Blueprint
-- A **Program** is a passive sequence of instructions and static data stored as a file on disk (an executable binary such as an ELF on Linux or `.exe` on Windows).
-- It consumes disk space, not CPU or RAM.
+- A **Program** is a passive sequence of instructions and static data stored as a file on disk (such as an ELF binary on Linux or a `.exe` on Windows).
+- It consumes disk space, not CPU cycles or RAM.
 - It defines *what* computation should occur, but it is not currently computing anything.
 
 ### The Process: Dynamic Living Instance
-- A **Process** is a live execution of a program loaded into memory.
+- A **Process** is a live, running execution of a program loaded into memory.
+- **The Core Mental Model — *"Instance is Process"*:** A program is a blueprint or recipe on disk; an active **instance** of that blueprint running in system memory is a **process**.
 - It possesses state: an instruction pointer (Program Counter), CPU register states, a private virtual memory footprint, open file descriptors, network sockets, security credentials, and signal handlers.
-- **One Program $\to$ Multiple Processes:** A single program file on disk (such as `/usr/bin/bash` or `/usr/bin/python3`) can instantiate dozens of independent processes concurrently.
+- **One Program $\to$ Multiple Processes:** A single program file on disk (such as `/usr/bin/bash`, `/usr/bin/python3`, or `webserver.exe`) can instantiate dozens or hundreds of independent processes concurrently.
 - **PID Uniqueness & Recycling:** Each process is assigned a unique positive integer known as its **Process Identifier (PID)**. When a process terminates and its exit status is reaped, its PID is released back into the kernel's PID pool for eventual reuse.
 
 ---
@@ -183,44 +184,56 @@ When an engineer types a command into an interactive shell (e.g., `ls -l` in Bas
   - **Environment Variables:** The `envp` array is passed to the new program image.
   - **Process Identity:** PID, PPID, real/effective UID/GID, session ID, and working directory persist across the execution boundary.
 
+### Demystifying the Raw Notes: "Child returns with 0. Parent returns value with 3721."
+A common point of confusion when studying operating systems is seeing return values listed under `execve()`:
+- **The Ambiguity:** In introductory study notes, engineers often jot down *"Child returns with 0. Parent returns value with 3721"* directly under `execve()`.
+- **The Systems Reality:**
+  1. **Those dual return values belong exclusively to `fork()`:** As detailed above, `fork()` is the syscall that is called once but returns twice — yielding `0` in the child process and the positive child PID (e.g. `3721`) in the parent process.
+  2. **`execve()` NEVER returns on success:** When `execve()` succeeds, the entire caller's code, stack, and heap are wiped and replaced with the new ELF executable. There is literally no original calling code left to return to! The CPU sets its program counter directly to the ELF entry point (`main()`) of the new binary.
+  3. **`execve()` ONLY returns on failure:** If and only if the kernel cannot execute the target binary (e.g., file not found `ENOENT`, permission denied `EACCES`, format error `ENOEXEC`), `execve()` returns `-1` to the caller and sets `errno`.
+  4. **The `0` in Child Lifecycle:** When the child program completes its job and calls `exit(0)`, the `0` represents its process termination status code, which the sleeping parent reaps via `wait()` / `waitpid()`.
+
 ---
 
 ## 5. Visual Process Lifecycle Flowchart
 
-The following Mermaid diagram maps the comprehensive state machine and system call orchestration across the entire execution loop:
+The following Mermaid diagram maps the complete execution loop required by the POSIX model:  
+`Parent Process (Bash)` $\to$ `fork()` $\to$ `Parent sleeps / Child calls execve()` $\to$ `Program runs & exits` $\to$ `Parent wakes up via wait()`.
 
 ```mermaid
 flowchart TD
-    subgraph Shell_Execution_Loop ["Linux Process Lifecycle Loop"]
-        A["Parent Process: Bash<br><code>PID: 4000</code>"] -->|"1. User enters command<br>calls fork()"| B{"Kernel Syscall: fork()"}
-        
-        %% Fork branches
-        B -->|"Returns Child PID (4001)"| C["Parent enters wait()<br><code>State: S (TASK_INTERRUPTIBLE)</code>"]
-        B -->|"Returns 0"| D["Child Process Clone<br><code>PID: 4001 (Identical Memory)</code>"]
-        
-        %% Execve transition
-        D -->|"2. Child calls execve('/usr/bin/ls')"| E["Kernel Memory Wipe<br><i>Code, Stack, Heap replaced</i><br><b>PID 4001 preserved</b>"]
-        E -->|"3. Binary loaded & starts"| F["Executable Running: ls<br><code>State: R (TASK_RUNNING)</code>"]
-        
-        %% Execution and exit
-        F -->|"4. Program finishes execution"| G["calls exit(status_code)"]
-        G -->|"5. Kernel deallocates memory"| H["Child Enters Zombie State<br><code>State: Z (EXIT_ZOMBIE)</code><br><i>Keeps PCB, PID & exit status</i>"]
-        
-        %% Signal & Reap
-        H -.->|"6. Kernel sends SIGCHLD"| C
-        C -->|"7. Parent wakes up<br>harvests exit status"| I["Kernel Clears PCB & Frees PID 4001"]
-        I -->|"8. Shell displays prompt"| A
-    end
+    %% Execution Loop Sequence
+    ParentBash["1. Parent Process: Bash<br>[PID: 4000]"] -->|"calls fork()"| SyscallFork{"Kernel: fork()"}
+    
+    %% Fork Branches
+    SyscallFork -->|"Returns Child PID (4001)"| ParentSleep["2. Parent Sleeps<br>calls wait() / waitpid()<br>State: S (TASK_INTERRUPTIBLE)"]
+    SyscallFork -->|"Returns 0"| ChildClone["2. Child Process Clone<br>[PID: 4001, PPID: 4000]"]
+    
+    %% Child Transformation
+    ChildClone -->|"calls execve('/bin/ls')"| ExecveTransition["3. Child calls execve()<br>Memory Wiped, Binary Loaded<br>PID 4001 Preserved"]
+    
+    %% Running and Exit
+    ExecveTransition -->|"starts execution"| ProgramRun["4. Program Runs & Exits<br>ls runs, writes output<br>calls exit(0)"]
+    
+    %% Zombie and Signal
+    ProgramRun -->|"kernel frees memory"| ZombieState["Child Enters Zombie State<br>State: Z (EXIT_ZOMBIE)<br>Holds exit code 0"]
+    
+    %% Wakeup and Reap
+    ZombieState -.->|"Kernel sends SIGCHLD"| ParentSleep
+    ParentSleep -->|"5. Parent wakes up via wait()<br>Harvests exit code (0)"| Reaped["Process Reaped<br>PID 4001 Freed from Table"]
+    Reaped -->|"Ready for next command"| ParentBash
 
-    classDef active fill:#1e3a8a,stroke:#3b82f6,stroke-width:2px,color:#ffffff;
-    classDef kernel fill:#701a75,stroke:#d946ef,stroke-width:2px,color:#ffffff;
-    classDef waiting fill:#854d0e,stroke:#eab308,stroke-width:2px,color:#ffffff;
-    classDef dead fill:#7f1d1d,stroke:#ef4444,stroke-width:2px,color:#ffffff;
+    %% Theme-agnostic class styles for GitHub light and dark mode
+    classDef default fill:#f8fafc,stroke:#475569,stroke-width:1px,color:#0f172a;
+    classDef highlight fill:#dbeafe,stroke:#2563eb,stroke-width:2px,color:#1e3a8a;
+    classDef kernel fill:#f3e8ff,stroke:#9333ea,stroke-width:2px,color:#581c87;
+    classDef waiting fill:#fef3c7,stroke:#d97706,stroke-width:2px,color:#78350f;
+    classDef dead fill:#fee2e2,stroke:#dc2626,stroke-width:2px,color:#7f1d1d;
 
-    class A,D,F active;
-    class B,E,I kernel;
-    class C waiting;
-    class G,H dead;
+    class ParentBash,ChildClone,ProgramRun highlight;
+    class SyscallFork,ExecveTransition,Reaped kernel;
+    class ParentSleep waiting;
+    class ZombieState dead;
 ```
 
 ---
@@ -478,79 +491,253 @@ This experiment demonstrates process cloning with `os.fork()`, observes parent P
 ```python
 #!/usr/bin/env python3
 """
-orphan_demo.py - Process Creation, Forking, and Orphan Reparenting
+orphan_demo.py - Process Creation, Forking, and Orphan Reparenting in Python
+Demonstrates:
+  1. Process creation via os.fork()
+  2. Fork return values (Child PID to parent, 0 to child)
+  3. Premature parent termination leaving the child orphaned
+  4. Automatic kernel reparenting to adoptive guardian (PID 1 or Subreaper)
+  5. Synchronous supervisor coordination to ensure clean terminal output
 """
 import os
 import sys
 import time
 
-def main():
-    parent_pid = os.getpid()
+def read_kernel_ppid(pid: int) -> int:
+    """Read true PPid directly from kernel via /proc/<pid>/status."""
+    try:
+        with open(f"/proc/{pid}/status", "r") as f:
+            for line in f:
+                if line.startswith("PPid:"):
+                    return int(line.split()[1])
+    except (FileNotFoundError, IndexError, ValueError):
+        pass
+    return os.getppid()
+
+def read_comm_name(pid: int) -> str:
+    """Read process name directly from /proc/<pid>/comm."""
+    try:
+        with open(f"/proc/{pid}/comm", "r") as f:
+            return f.read().strip()
+    except (FileNotFoundError, PermissionError):
+        return "system/guardian"
+
+def run_experiment():
+    supervisor_pid = os.getpid()
     print("=" * 65)
-    print(f"[*] [Parent: {parent_pid}] Starting process lifecycle experiment")
-    print(f"[*] [Parent: {parent_pid}] Calling os.fork()...")
+    print(f"[*] [Supervisor: {supervisor_pid}] Starting process lifecycle experiment")
     print("=" * 65)
     sys.stdout.flush()
 
-    pid = os.fork()
+    # Pipe for synchronizing Child PID to Supervisor
+    r_pipe, w_pipe = os.pipe()
 
-    if pid > 0:
-        # --- PARENT PROCESS BRANCH ---
-        print(f"[+] [Parent: {parent_pid}] fork() returned Child PID: {pid}")
-        print(f"[+] [Parent: {parent_pid}] Parent will terminate now without calling wait().")
-        print(f"[+] [Parent: {parent_pid}] Child {pid} is now an orphan!")
+    # Step 1: Supervisor forks Parent Worker
+    parent_worker_pid = os.fork()
+
+    if parent_worker_pid == 0:
+        # Inside Worker Parent
+        os.close(r_pipe)
+        p_pid = os.getpid()
+        print(f"[*] [Parent:     {p_pid}] Worker Parent running. Calling os.fork() to spawn child...")
         sys.stdout.flush()
-        sys.exit(0)
-    else:
-        # --- CHILD PROCESS BRANCH ---
-        child_pid = os.getpid()
-        initial_ppid = os.getppid()
-        print(f"[+] [Child:  {child_pid}] Child process running!")
-        print(f"[+] [Child:  {child_pid}] Initial PPID (Biological Parent): {initial_ppid}")
-        print(f"[+] [Child:  {child_pid}] Sleeping 2 seconds to ensure parent terminates first...")
-        sys.stdout.flush()
-        
-        time.sleep(2)
-        
-        reparented_ppid = os.getppid()
-        print("-" * 65)
-        print(f"[!] [Child:  {child_pid}] Child awoke! Querying kernel for current PPID...")
-        print(f"[!] [Child:  {child_pid}] New PPID (Adoptive Parent): {reparented_ppid}")
-        
-        try:
-            with open(f"/proc/{reparented_ppid}/comm", "r") as f:
-                guardian_name = f.read().strip()
-            print(f"[!] [Child:  {child_pid}] Guardian Name: '{guardian_name}' (PID: {reparented_ppid})")
-        except Exception as e:
-            print(f"[!] [Child:  {child_pid}] Guardian PID {reparented_ppid}")
-            
-        print("=" * 65)
-        sys.stdout.flush()
+
+        child_pid = os.fork()
+
+        if child_pid == 0:
+            # Inside Child
+            c_pid = os.getpid()
+            bio_ppid = os.getppid()
+            bio_name = read_comm_name(bio_ppid)
+            print(f"[+] [Child:      {c_pid}] Child created! Biological Parent PPID: {bio_ppid} ('{bio_name}')")
+            sys.stdout.flush()
+
+            # Pass child PID to supervisor
+            os.write(w_pipe, f"{c_pid}\n".encode())
+            os.close(w_pipe)
+
+            # Wait for biological parent to terminate
+            print(f"[+] [Child:      {c_pid}] Waiting for Biological Parent ({bio_ppid}) to terminate...")
+            sys.stdout.flush()
+            while os.path.exists(f"/proc/{bio_ppid}"):
+                time.sleep(0.05)
+
+            # Allow kernel reparenting lock to settle
+            time.sleep(0.2)
+
+            adoptive_ppid = os.getppid()
+            adoptive_name = read_comm_name(adoptive_ppid)
+            print("-" * 65)
+            print(f"[!] [Child:      {c_pid}] Biological Parent died! Querying kernel for new PPID...")
+            print(f"[!] [Child:      {c_pid}] Adoptive Parent PPID: {adoptive_ppid}")
+            print(f"[!] [Child:      {c_pid}] Guardian Name: '{adoptive_name}' (PID: {adoptive_ppid})")
+            print("=" * 65)
+            sys.stdout.flush()
+            sys.exit(0)
+        else:
+            # Inside Worker Parent: exit immediately without waiting for Child
+            print(f"[+] [Parent:     {p_pid}] fork() returned Child PID: {child_pid}")
+            print(f"[+] [Parent:     {p_pid}] Parent will now EXIT IMMEDIATELY without calling wait().")
+            print(f"[+] [Parent:     {p_pid}] Child {child_pid} is now an orphan!")
+            sys.stdout.flush()
+            sys.exit(0)
+
+    # Inside Supervisor:
+    os.close(w_pipe)
+    # Wait for Parent Worker to exit
+    _, status = os.waitpid(parent_worker_pid, 0)
+    print(f"[*] [Supervisor: {supervisor_pid}] Observed Worker Parent {parent_worker_pid} exit cleanly.")
+    sys.stdout.flush()
+
+    # Read child PID from pipe
+    child_line = os.read(r_pipe, 128).decode().strip()
+    os.close(r_pipe)
+
+    if child_line:
+        child_pid = int(child_line)
+        # Wait for orphan child to finish execution before returning shell prompt
+        while os.path.exists(f"/proc/{child_pid}"):
+            time.sleep(0.05)
+
+    print(f"[*] [Supervisor: {supervisor_pid}] Experiment completed successfully.")
 
 if __name__ == "__main__":
-    main()
+    run_experiment()
 ```
 
 #### Actual Terminal Execution Output
 ```console
 $ python3 lab/orphan_demo.py
 =================================================================
-[*] [Parent: 4345] Starting process lifecycle experiment
-[*] [Parent: 4345] Calling os.fork()...
+[*] [Supervisor: 4934] Starting process lifecycle experiment
 =================================================================
-[+] [Parent: 4345] fork() returned Child PID: 4346
-[+] [Parent: 4345] Parent will terminate now without calling wait().
-[+] [Parent: 4345] Child 4346 is now an orphan!
-[+] [Child:  4346] Child process running!
-[+] [Child:  4346] Initial PPID (Biological Parent): 4345
-[+] [Child:  4346] Sleeping 2 seconds to ensure parent terminates first...
+[*] [Parent:     4941] Worker Parent running. Calling os.fork() to spawn child...
+[+] [Parent:     4941] fork() returned Child PID: 4942
+[+] [Parent:     4941] Parent will now EXIT IMMEDIATELY without calling wait().
+[+] [Parent:     4941] Child 4942 is now an orphan!
+[+] [Child:      4942] Child created! Biological Parent PPID: 4941 ('python3')
+[+] [Child:      4942] Waiting for Biological Parent (4941) to terminate...
+[*] [Supervisor: 4934] Observed Worker Parent 4941 exit cleanly.
 -----------------------------------------------------------------
-[!] [Child:  4346] Child awoke! Querying kernel for current PPID...
-[!] [Child:  4346] New PPID (Adoptive Parent): 4337
-[!] [Child:  4346] Guardian Name: 'Relay(4338)' (PID: 4337)
+[!] [Child:      4942] Biological Parent died! Querying kernel for new PPID...
+[!] [Child:      4942] Adoptive Parent PPID: 4933
+[!] [Child:      4942] Guardian Name: 'Relay(4934)' (PID: 4933)
 =================================================================
+[*] [Supervisor: 4934] Experiment completed successfully.
 ```
-> **Observation:** Notice how Child `PID 4346` initially had `PPID 4345`. When Parent `4345` died, the kernel dynamically reparented the running child to the active subreaper guardian (`PID 4337`), proving the adoption mechanism in real time.
+
+---
+
+### Lab 2b: Pure Bash Orphan Reparenting & The `$PPID` Trap (`orphan_demo.sh`)
+
+#### Verification Script (`orphan_demo.sh`)
+```bash
+#!/bin/bash
+# orphan_demo.sh - Demonstrating Process Forking and Orphan Reparenting in Pure Bash
+
+set -e
+
+TMP_DIR=$(mktemp -d /tmp/orphan_lab.XXXXXX)
+trap 'rm -rf "${TMP_DIR}"' EXIT
+
+CHILD_READY="${TMP_DIR}/child_ready"
+CHILD_DONE="${TMP_DIR}/child_done"
+CHILD_PID_FILE="${TMP_DIR}/child_pid"
+
+SUPERVISOR_PID=$$
+echo "[*] [Supervisor: ${SUPERVISOR_PID}] Initializing experiment..."
+
+# Launch Worker Parent in background
+(
+    WORKER_PID=$$
+    echo "[*] [Parent:     ${WORKER_PID}] Worker Parent running. Forking child..."
+    
+    # Spawn Child subshell
+    (
+        CHILD_PID=$BASHPID
+        echo "${CHILD_PID}" > "${CHILD_PID_FILE}"
+        
+        # Read biological parent PID directly from kernel /proc
+        BIO_PPID=$(awk '/^PPid:/ {print $2}' "/proc/${CHILD_PID}/status")
+        BIO_NAME=$(cat "/proc/${BIO_PPID}/comm" 2>/dev/null || echo "bash")
+        
+        echo "[+] [Child:      ${CHILD_PID}] Child running! Biological Parent PPID: ${BIO_PPID} ('${BIO_NAME}')"
+        
+        # Signal Worker Parent that Child has recorded biological parent
+        touch "${CHILD_READY}"
+        
+        echo "[+] [Child:      ${CHILD_PID}] Waiting for biological parent (${BIO_PPID}) to exit..."
+        while [ -d "/proc/${BIO_PPID}" ]; do
+            sleep 0.05
+        done
+        
+        # Brief pause for kernel reparenting to complete
+        sleep 0.2
+        
+        # Query new adoptive parent PID from kernel
+        ADOPTIVE_PPID=$(awk '/^PPid:/ {print $2}' "/proc/${CHILD_PID}/status")
+        GUARDIAN_NAME=$(cat "/proc/${ADOPTIVE_PPID}/comm" 2>/dev/null || echo "guardian")
+        
+        echo "------------------------------------------------------------"
+        echo "[!] [Child:      ${CHILD_PID}] Biological parent terminated! Querying kernel for new PPID..."
+        echo "[!] [Child:      ${CHILD_PID}] Adoptive Parent PPID: ${ADOPTIVE_PPID}"
+        echo "[!] [Child:      ${CHILD_PID}] Guardian Name: '${GUARDIAN_NAME}' (PID: ${ADOPTIVE_PPID})"
+        echo "============================================================"
+        touch "${CHILD_DONE}"
+    ) &
+    
+    CHILD_JOB_PID=$!
+    
+    # Wait until Child signals that it is ready and recorded BIO_PPID
+    while [ ! -f "${CHILD_READY}" ]; do
+        sleep 0.02
+    done
+    
+    echo "[+] [Parent:     ${WORKER_PID}] Child is ready (PID: ${CHILD_JOB_PID})."
+    echo "[+] [Parent:     ${WORKER_PID}] Parent exiting now without waiting for Child!"
+    echo "[+] [Parent:     ${WORKER_PID}] Child ${CHILD_JOB_PID} is now an orphan."
+    exit 0
+) &
+
+PARENT_JOB_PID=$!
+wait "${PARENT_JOB_PID}" 2>/dev/null || true
+echo "[*] [Supervisor: ${SUPERVISOR_PID}] Observed Worker Parent (PID ${PARENT_JOB_PID}) exit."
+
+# Wait for Child to complete its demonstration
+while [ ! -f "${CHILD_DONE}" ]; do
+    sleep 0.05
+done
+
+echo "[*] [Supervisor: ${SUPERVISOR_PID}] Experiment completed successfully."
+```
+
+#### Actual Terminal Execution Output
+```console
+$ bash lab/orphan_demo.sh
+============================================================
+   BASH ORPHAN REPARENTING LAB (Pure Bash & /proc)          
+============================================================
+[*] [Supervisor: 5437] Initializing experiment...
+[*] [Parent:     5437] Worker Parent running. Forking child...
+[+] [Child:      5440] Child running! Biological Parent PPID: 5439 ('bash')
+[+] [Child:      5440] Waiting for biological parent (5439) to exit...
+[+] [Parent:     5437] Child is ready (PID: 5440).
+[+] [Parent:     5437] Parent exiting now without waiting for Child!
+[+] [Parent:     5437] Child 5440 is now an orphan.
+[*] [Supervisor: 5437] Observed Worker Parent (PID 5439) exit.
+------------------------------------------------------------
+[!] [Child:      5440] Biological parent terminated! Querying kernel for new PPID...
+[!] [Child:      5440] Adoptive Parent PPID: 5436
+[!] [Child:      5440] Guardian Name: 'Relay(5437)' (PID: 5436)
+============================================================
+[*] [Supervisor: 5437] Experiment completed successfully.
+```
+
+> **Deep-Dive Systems Analysis:**
+> 1. **The Biological Parent Exit:** When Parent `PID 4941` / `PID 5439` terminated without calling `wait()`, the child became an orphan. In traditional operating systems, children might terminate or get lost; in Linux, the kernel's process scheduler instantly intercepts the orphaned child's `task_struct`.
+> 2. **Subreaper vs. Root PID 1:** Why did the child reparent to `Relay` (`PID 4933` / `PID 5436`) instead of `PID 1` (`systemd`)?  
+>    In modern Linux systems, ancestor processes can register as an official **child subreaper** using `prctl(PR_SET_CHILD_SUBREAPER, 1)`. When a process becomes an orphan, the kernel walks up the process tree looking for the nearest ancestor marked as a subreaper. WSL2 uses a background relay subreaper daemon (`Relay`), while systemd desktop sessions run user managers (`systemd --user`). If no subreaper is registered along the ancestry tree (such as inside standard minimalist container namespaces), the orphan reparents directly to system root **PID 1**.
+> 3. **The Static Bash `$PPID` Trap:** Many engineers mistakenly write `echo $PPID` in Bash scripts to detect orphan reparenting. However, Bash initializes `$PPID` once as a static read-only variable upon shell invocation. It never re-queries the kernel! To detect dynamic kernel reparenting in Bash, one MUST query `/proc/$BASHPID/status` (`PPid:` line), which directly reads the live `task_struct` inside the Linux kernel.
 
 ---
 

@@ -30,16 +30,34 @@ The [`lab/`](./lab) directory contains runnable scripts demonstrating these conc
 ### Running the Labs
 ```bash
 # Make scripts executable
-chmod +x lab/*.sh lab/*.py
+chmod +x lab/*.sh lab/*.py *.sh
 
 # Run /proc inspection lab
 ./lab/inspect_proc.sh
 
-# Run orphan reparenting lab
+# Run Python orphan reparenting lab (supervisor-coordinated)
 python3 lab/orphan_demo.py
+
+# Run pure Bash orphan reparenting lab (/proc kernel inspection)
+bash lab/orphan_demo.sh
 
 # Run FD inheritance & O_CLOEXEC lab
 python3 lab/fd_cloexec_demo.py
+```
+
+---
+
+## 🚢 Push to GitHub
+
+To push this repository to your GitHub account (`isswansalty-tech/day-01-linux-processes`):
+
+```bash
+# From Linux / WSL:
+./push_to_github.sh
+
+# Or authenticate and create repository directly with GitHub CLI:
+gh auth login
+gh repo create isswansalty-tech/day-01-linux-processes --public --source=. --remote=origin --push
 ```
 
 ---
