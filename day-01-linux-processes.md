@@ -1,8 +1,7 @@
 # Day 1: Linux Process Fundamentals & Lifecycle
 
 > **Portfolio Learning Log — Day 1**  
-> **What I Learnt & What I Built Today**  
-> *Author:* abir ([@isswansalty-tech](https://github.com/isswansalty-tech))  
+> **Topic:** Linux Process Fundamentals, Memory Isolation & Execution Lifecycle  
 
 ---
 
