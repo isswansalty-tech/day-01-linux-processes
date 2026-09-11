@@ -4,11 +4,6 @@ Personal study notes and lab experiments covering process mechanics, kernel acco
 
 ---
 
-## Overview
-Notes from Day 1 exploring Linux process internals: how programs execute, how the kernel handles CPU scheduling and virtual memory isolation, how `fork()` and `execve()` transform processes, and why PID 1 behaves differently from normal processes.
-
----
-
 # Part 1: What I Learnt Today
 
 ## 1. Programs vs. Processes
@@ -22,7 +17,7 @@ Notes from Day 1 exploring Linux process internals: how programs execute, how th
 ---
 
 ## 2. What the Kernel Tracks for Every Process
-The Linux kernel maintains a dedicated bookkeeping structure for every process on the system (the `task_struct` / Process Control Block):
+The Linux kernel tracks each process using an internal structure (`task_struct`):
 * **PID & PPID:** The process's own ID (`PID`) and its parent's process ID (`PPID`).
 * **UID & Group ID:** User and Group IDs defining ownership and permissions.
 * **Virtual Memory:** The private virtual address space mapped for that process.
@@ -37,10 +32,10 @@ The Linux kernel maintains a dedicated bookkeeping structure for every process o
 * It decides which process gets CPU time, lands on which core, and how many milliseconds it gets to run.
 * It prioritizes which process to run based on priority, urgency, and virtual deadlines so no process starves.
 
-### Virtual Memory: The Isolation Illusion
+### Virtual Memory
 * **A process never talks directly to physical RAM.**
-* Instead, the kernel gives each process its own **virtual address space**—an illusion that the process has the entire memory range to itself.
-* The kernel and the CPU's MMU (Memory Management Unit) translate those virtual addresses into physical RAM locations on the fly.
+* Instead, the kernel gives each process its own **virtual address space**—an illusion making the process believe it has the entire memory range to itself.
+* The kernel and CPU translate those virtual addresses secretly into physical RAM locations.
 * **Every process has its own separate virtual address space.** Process A cannot see or corrupt Process B's memory because their virtual addresses map to completely different physical pages.
 
 ---
@@ -83,37 +78,20 @@ Here is the cycle that occurs when running a command in a shell:
 
 ```mermaid
 flowchart TD
-    %% Execution Loop
     ParentBash["1. Parent Process: Bash<br>[PID: 4000]"] -->|"calls fork()"| SyscallFork{"Kernel: fork()"}
     
-    %% Fork Branches
     SyscallFork -->|"Returns Child PID (4001)"| ParentSleep["2. Parent Sleeps<br>calls wait() / waitpid()<br>State: S (TASK_INTERRUPTIBLE)"]
     SyscallFork -->|"Returns 0"| ChildClone["2. Child Process Clone<br>[PID: 4001, PPID: 4000]"]
     
-    %% Child Transformation
     ChildClone -->|"calls execve('/bin/ls')"| ExecveTransition["3. Child calls execve()<br>Memory Wiped, Binary Loaded<br>PID 4001 Preserved"]
     
-    %% Running and Exit
     ExecveTransition -->|"starts execution"| ProgramRun["4. Program Runs & Exits<br>ls runs, writes output<br>calls exit(0)"]
     
-    %% Zombie and Signal
     ProgramRun -->|"kernel frees memory"| ZombieState["Child Enters Zombie State<br>State: Z (EXIT_ZOMBIE)<br>Holds exit code 0"]
     
-    %% Wakeup and Reap
     ZombieState -.->|"Kernel sends SIGCHLD"| ParentSleep
     ParentSleep -->|"5. Parent wakes up via wait()<br>Harvests exit code (0)"| Reaped["Process Reaped<br>PID 4001 Freed from Table"]
     Reaped -->|"Ready for next command"| ParentBash
-
-    classDef default fill:#f8fafc,stroke:#475569,stroke-width:1px,color:#0f172a;
-    classDef highlight fill:#dbeafe,stroke:#2563eb,stroke-width:2px,color:#1e3a8a;
-    classDef kernel fill:#f3e8ff,stroke:#9333ea,stroke-width:2px,color:#581c87;
-    classDef waiting fill:#fef3c7,stroke:#d97706,stroke-width:2px,color:#78350f;
-    classDef dead fill:#fee2e2,stroke:#dc2626,stroke-width:2px,color:#7f1d1d;
-
-    class ParentBash,ChildClone,ProgramRun highlight;
-    class SyscallFork,ExecveTransition,Reaped kernel;
-    class ParentSleep waiting;
-    class ZombieState dead;
 ```
 
 ---
@@ -133,14 +111,13 @@ flowchart TD
 
 ---
 
-## 8. Production & SRE Context: Containers & PID 1
+## 8. Containers and PID 1
 
-Why this matters in containers:
-* **The Docker PID 1 Trap:** Running a container without an init system (e.g. `CMD ["node", "server.js"]`) makes the application **PID 1 inside that container**.
-* **Zombie Leaks:** Standard applications (Node, Python, Java) don't implement zombie reaping loops. If child workers exit, they stay `<defunct>` in the process table.
-* **Host PID Exhaustion:** Containers share the host kernel. As zombies accumulate, they consume entries in `/proc/sys/kernel/pid_max`. Once full, new processes cannot fork anywhere on the host.
-* **Dropped Signals:** The kernel does not assign default signal handlers to PID 1. If an app doesn't explicitly trap `SIGTERM`, it ignores stop requests until Docker sends a brutal `SIGKILL` after 10s.
-* **The Fix:** Use `tini`, `dumb-init`, or Docker's `--init` flag to act as PID 1, handle signal forwarding, and reap zombies.
+Why running apps directly as PID 1 in Docker causes issues:
+* **Zombie Accumulation:** Standard applications (Node, Python, Go) do not implement zombie reaping loops. If child workers crash or spawn background processes, those orphans reparent to PID 1. When they exit, they stay `<defunct>` in the process table.
+* **Host PID Exhaustion:** Containers share the host kernel. As zombies accumulate, they consume entries in `/proc/sys/kernel/pid_max`. Once the table is full, no process can fork anywhere on the host.
+* **Ignored Signals:** The kernel does not assign default signal handlers to PID 1. If an app doesn't explicitly listen for `SIGTERM`, it ignores stop requests until Docker forces a `SIGKILL` after 10 seconds.
+* **Fix:** Use an init wrapper like `tini`, `dumb-init`, or Docker's `--init` flag to act as PID 1, forward signals, and reap zombies.
 
 ---
 
@@ -194,7 +171,7 @@ l-wx------ 1 abir abir 64 Sep 11 03:49 2 -> pipe:[34390]
 lr-x------ 1 abir abir 64 Sep 11 03:49 255 -> ./lab/inspect_proc.sh
 ```
 
-**Key takeaways from the run:**
+**What this showed:**
 - `/proc/<PID>/cmdline` stores arguments separated by null characters.
 - `/proc/<PID>/status` shows biological parent PID (`PPid: 5700`), process state (`S`), and memory usage (`VmSize` vs physical `VmRSS`).
 - `/proc/<PID>/fd` reveals file descriptors: `0`, `1`, `2` attached to standard pipes, and `255` referencing the running script itself.
@@ -224,7 +201,7 @@ $ python3 lab/orphan_demo.py
 [*] [Supervisor: 5718] Experiment completed successfully.
 ```
 
-**Key takeaways from the run:**
+**What this showed:**
 - `fork()` gave the child PID `5726` to the parent, while the child started with biological parent `PPID: 5725`.
 - When the worker parent terminated without calling `wait()`, the child continued executing.
 - The kernel immediately reparented the running orphan to the nearest active subreaper (`PID 5717`, `Relay`) instead of terminating it.
@@ -252,7 +229,7 @@ lrwx------ 1 abir abir 64 Sep 11 03:49 3 -> /tmp/leaked_secret.txt
 lr-x------ 1 abir abir 64 Sep 11 03:49 4 -> /proc/5751/fd
 ```
 
-**Key takeaways from the run:**
+**What this showed:**
 - FD 3 survived the `execve()` call and stayed accessible in the new `/bin/ls` process.
 - FD 4 with `O_CLOEXEC` (`inheritable=False`) was automatically closed by the kernel when `execve()` ran.
 
@@ -268,7 +245,7 @@ Testing `SIGKILL` directly against PID 1 as root:
       1 Ss   systemd
 ```
 
-**Key takeaways from the run:**
+**What this showed:**
 - Even running as root (`UID 0`), `SIGKILL` sent to PID 1 was silently discarded by the kernel. PID 1 remained in state `Ss`.
 
 ---
