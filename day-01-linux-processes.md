@@ -1,208 +1,132 @@
 # Day 1: Linux Process Fundamentals & Lifecycle
 
-> **Portfolio Documentation & Systems Engineering Deep Dive**  
-> *Author:* abir ([isswansalty-tech](https://github.com/isswansalty-tech))  
-> *Topic:* Linux Kernel Internals, Process Lifecycles, Memory Isolation, and SRE Best Practices
+> *A deep dive into kernel internals, the Bash execution loop, and why running PID 1 in Docker breaks things in production.*  
+> **Author:** abir ([@isswansalty-tech](https://github.com/isswansalty-tech))  
+> **Series:** 100 Days of Systems & Linux Engineering  
 
 ---
 
-## Table of Contents
-1. [Core Conceptual Architecture: Program vs. Process](#1-core-conceptual-architecture-program-vs-process)
-2. [Process Anatomy & Kernel Accounting](#2-process-anatomy--kernel-accounting)
-3. [CPU Scheduling & Memory Management: The Illusion of Isolation](#3-cpu-scheduling--memory-management-the-illusion-of-isolation)
-4. [Process Creation & Transformation: `fork()` and `execve()`](#4-process-creation--transformation-fork-and-execve)
-5. [Visual Process Lifecycle Flowchart](#5-visual-process-lifecycle-flowchart)
-6. [PID 1: The Root Guardian & Orphan Management](#6-pid-1-the-root-guardian--orphan-management)
-7. [Production & SRE Context: Containers, PID 1, and Host Exhaustion](#7-production--sre-context-containers-pid-1-and-host-exhaustion)
-8. [Critical Gotchas & Systems Edge Cases](#8-critical-gotchas--systems-edge-cases)
-9. [Hands-On Terminal Lab & Proof of Work](#9-hands-on-terminal-lab--proof-of-work)
-10. [Systems Engineer Reference & Cheat Sheet](#10-systems-engineer-reference--cheat-sheet)
+## What We're Breaking Down Today
+Ever wonder what *actually* happens under the hood when you open up a terminal, type a command like `ls` or `python app.py`, and hit `Enter`? 
+
+Today is **Day 1** of my systems engineering deep-dive. We are cutting past the high-level fluff to inspect the actual mechanics of the Linux kernel: how processes come to life, how the kernel isolates memory, how processes transform themselves, and why understanding process lifecycles separates junior devs from senior SREs when production goes down.
+
+Here is the game plan:
+1. [The Foundation: Program vs. Process](#1-the-foundation-program-vs-process)
+2. [How the Kernel Tracks Everything](#2-how-the-kernel-tracks-everything)
+3. [CPU & Memory: The Great Kernel Illusion](#3-cpu--memory-the-great-kernel-illusion)
+4. [Process Creation: Bash Clones Itself (`fork` + `execve`)](#4-process-creation-bash-clones-itself-fork--execve)
+5. [The Execution Loop (Visualized)](#5-the-execution-loop-visualized)
+6. [PID 1: The First Process & Guardian of Orphans](#6-pid-1-the-first-process--guardian-of-orphans)
+7. [Production & SRE Reality: The Container PID 1 Trap](#7-production--sre-reality-the-container-pid-1-trap)
+8. [Edge Cases & Interview Gotchas](#8-edge-cases--interview-gotchas)
+9. [Terminal Lab: Proving It in Real Time](#9-terminal-lab-proving-it-in-real-time)
 
 ---
 
-## 1. Core Conceptual Architecture: Program vs. Process
+## 1. The Foundation: Program vs. Process
 
-At the foundation of operating systems lies a critical distinction between static code resting on non-volatile storage and active computation executing within memory.
+Let's start with the most fundamental mental model in systems programming:
 
 ```
-+-------------------------------------------------------------+
-|                      STORAGE DISK                           |
-|  +-------------------------------------------------------+  |
-|  |  Executable File (e.g. /usr/bin/bash, binary.exe)     |  |
-|  |  - Compiled Machine Code (.text)                      |  |
-|  |  - Initialized Data (.data)                           |  |
-|  |  - ELF Headers & Symbols                              |  |
-|  +-------------------------------------------------------+  |
-+-------------------------------------------------------------+
-                              |
-                     [ Kernel Loader: execve() ]
-                              v
-+-------------------------------------------------------------+
-|                     SYSTEM MEMORY (RAM)                     |
-|                                                             |
-|  Process Instance A (PID 1042)    Process Instance B (PID 1043)
-|  +--------------------------+     +--------------------------+
-|  | Code / Text Segment      |     | Code / Text Segment      |
-|  | Heap (Dynamic Alloc)     |     | Heap (Dynamic Alloc)     |
-|  | Stack (Local Frames)     |     | Stack (Local Frames)     |
-|  | File Descriptors [0,1,2] |     | File Descriptors [0,1,2] |
-|  +--------------------------+     +--------------------------+
-+-------------------------------------------------------------+
+[ Disk Storage ]                             [ System Memory (RAM) ]
++----------------------------+               +----------------------------+
+|  Program File (.exe, ELF)  |  -- Executed --> |     Running Process        |
+|  (Passive Blueprint)       |               |     (Active Instance)      |
++----------------------------+               +----------------------------+
 ```
 
-### The Program: Static Inanimate Blueprint
-- A **Program** is a passive sequence of instructions and static data stored as a file on disk (such as an ELF binary on Linux or a `.exe` on Windows).
-- It consumes disk space, not CPU cycles or RAM.
-- It defines *what* computation should occur, but it is not currently computing anything.
-
-### The Process: Dynamic Living Instance
-- A **Process** is a live, running execution of a program loaded into memory.
-- **The Core Mental Model — *"Instance is Process"*:** A program is a blueprint or recipe on disk; an active **instance** of that blueprint running in system memory is a **process**.
-- It possesses state: an instruction pointer (Program Counter), CPU register states, a private virtual memory footprint, open file descriptors, network sockets, security credentials, and signal handlers.
-- **One Program $\to$ Multiple Processes:** A single program file on disk (such as `/usr/bin/bash`, `/usr/bin/python3`, or `webserver.exe`) can instantiate dozens or hundreds of independent processes concurrently.
-- **PID Uniqueness & Recycling:** Each process is assigned a unique positive integer known as its **Process Identifier (PID)**. When a process terminates and its exit status is reaped, its PID is released back into the kernel's PID pool for eventual reuse.
+### The Mental Model: *"An Instance is a Process"*
+- **A Program is just dead bytes on a disk.** It's an executable file (`.exe` on Windows, or an ELF binary like `/usr/bin/bash` on Linux). It sits there taking up disk space, doing absolutely nothing until someone tells the OS to run it.
+- **A Process is alive.** It is an active execution of that program loaded into memory, consuming CPU cycles, allocating heap space, and opening file descriptors.
+- **1 Program $\to$ Multiple Processes:** Just like you can open five different Chrome windows or run three background Python scripts from the exact same script file, a single program on disk can have dozens of live running processes.
+- **PIDs and Recycling:** Every process gets a unique numeric ID called a **PID (Process Identifier)**. PIDs aren't infinite—when a process dies and gets reaped, its PID goes back into the kernel pool to be reused later.
 
 ---
 
-## 2. Process Anatomy & Kernel Accounting
+## 2. How the Kernel Tracks Everything
 
-A process does not exist in isolation; the Linux kernel tracks and manages every active entity via an internal data structure called the **Process Control Block (PCB)**, represented in kernel source by `struct task_struct` (defined in `include/linux/sched.h`).
+The Linux kernel is obsessive about bookkeeping. For every single process running on the machine, the kernel maintains an internal structure called the **Process Control Block (`struct task_struct`)**. 
 
-For every live process, the kernel meticulously maintains:
-
-| Attribute | Internal Kernel Meaning | Real-World Inspection Point |
-| :--- | :--- | :--- |
-| **PID & PPID** | Process ID and Parent Process ID. Every process (except PID 0) has a parent. | `/proc/<PID>/status` (`Pid:`, `PPid:`) |
-| **Credentials** | Real UID/GID, Effective UID/GID (for permissions), Saved UID/GID. | `/proc/<PID>/status` (`Uid:`, `Gid:`) |
-| **Virtual Memory** | Memory descriptor (`struct mm_struct`) pointing to page tables and address mappings. | `/proc/<PID>/maps`, `/proc/<PID>/smaps` |
-| **File Descriptors (FD)** | Table of open files, sockets, pipes, and devices (`struct files_struct`). | `/proc/<PID>/fd/` |
-| **Execution State** | Current scheduling state (`R` Running, `S` Interruptible Sleep, `D` Disk Sleep, `Z` Zombie). | `/proc/<PID>/stat` |
-| **Signal Dispositions** | Pending signals, blocked masks, and registered custom signal handlers. | `/proc/<PID>/status` (`SigCgt:`, `SigIgn:`) |
+Whenever a process does anything, the kernel references this struct to check:
+- **PID & PPID:** Who are you (`PID`), and who created you (`PPID` — Parent PID)?
+- **Credentials (UID / GID):** Which user and group own this process? What are its permissions?
+- **Virtual Memory Map:** What parts of memory does this process think it owns?
+- **File Descriptor Table (FDs):** What files, terminal pipes, or network sockets does it currently have open? (FD 0 is `stdin`, FD 1 is `stdout`, FD 2 is `stderr`).
 
 ---
 
-## 3. CPU Scheduling & Memory Management: The Illusion of Isolation
+## 3. CPU & Memory: The Great Kernel Illusion
 
-Two core abstractions allow thousands of competing processes to coexist predictably on physical hardware: **Scheduling** and **Virtual Memory**.
+### The Scheduler: Your CPU's Traffic Police
+Your computer might have 8 or 16 CPU cores, but your system is running hundreds of processes right now. How do they all run at once?
 
-### The CPU Scheduler: The Kernel's Traffic Police
-Modern multi-core systems frequently run hundreds or thousands of threads with only 8, 16, or 64 physical CPU cores available. 
+Enter the **Linux CPU Scheduler** (historically CFS, and in modern Linux 6.6+, **EEVDF** — Earliest Eligible Virtual Deadline First). 
+- Think of the scheduler as **traffic police** standing at a busy intersection.
+- It decides which process gets onto which CPU core, how many milliseconds it gets to run (its timeslice), and when it needs to be kicked off so another process gets a turn.
+- High-priority and urgent tasks get green-lighted first, while background batch jobs wait in line.
 
-- **The Role:** The Linux CPU scheduler functions exactly like an ultra-fast **traffic police officer**. It constantly monitors the runqueue, determines which process gains access to a CPU core, decides precisely which core it lands on, and calculates how many milliseconds (or nanoseconds) it may execute before being preempted.
-- **Fairness & Urgency:** The scheduler prioritizes execution based on dynamic priority, latency sensitivity, and niceness values.
-- **Evolution (CFS to EEVDF):** For over a decade, Linux relied on the **CFS (Completely Fair Scheduler)**, which utilized a red-black tree indexed by virtual runtime (`vruntime`) to guarantee fair CPU time. Starting with **Linux kernel 6.6**, Linux introduced **EEVDF (Earliest Eligible Virtual Deadline First)**. EEVDF improves upon CFS by scheduling tasks based on both eligibility (fair allocation) and latency deadlines, ensuring that interactive and latency-critical processes are not delayed behind throughput-heavy background batch jobs.
+### Virtual Memory: The RAM Illusion
+Here is a wild fact: **A process never, ever touches your physical RAM chips directly.**
 
-### Virtual Address Space: The Isolation Illusion
-A user space process **never communicates directly with your physical RAM chips**.
-
-```
-+-----------------------------+         +-----------------------------+
-|    Process A (PID 101)      |         |    Process B (PID 102)      |
-| Virtual Address Space (VAS) |         | Virtual Address Space (VAS) |
-|   0x00007fff8000 (Virtual)  |         |   0x00007fff8000 (Virtual)  |
-+--------------+--------------+         +--------------+--------------+
-               |                                       |
-               |  [ MMU: Hardware Page Translation ]   |
-               +-------------------+   +---------------+
-                                   |   |
-                                   v   v
-                 +-----------------------------------+
-                 |         PHYSICAL RAM (DDR5)       |
-                 |  Frame 0x1A400 (Process A Page)   |
-                 |  Frame 0x8F200 (Process B Page)   |
-                 +-----------------------------------+
-```
-
-- **The Private Universe:** The kernel provides each process with its own separate **Virtual Address Space (VAS)**. To Process A, it appears as though it owns a contiguous, multi-terabyte block of memory all to itself (e.g., up to 128 TB of user-space addresses in standard 48-bit x86_64 architecture).
-- **Hardware-Enforced Translation:** The CPU's hardware **Memory Management Unit (MMU)** works in tandem with kernel page tables to secretly translate these virtual memory addresses into discrete physical RAM frames.
-- **Absolute Memory Protection:** Even if Process A and Process B use identical virtual addresses (e.g., `0x00007fff8000`), the MMU translates them to completely different physical RAM frames. A non-privileged process is strictly incapable of reading, corrupting, or modifying the memory of another process or the kernel.
+Instead, the Linux kernel gives every single process its own private **Virtual Address Space (VAS)**. 
+- It’s an illusion: the process genuinely believes it owns a massive, continuous block of memory all to itself (e.g., from `0x000000000000` up to `0x7FFFFFFFFFFF` on 64-bit x86).
+- Behind the scenes, the kernel and the CPU's **Memory Management Unit (MMU)** work together like secret translators. They map those fake virtual addresses to scattered, real physical RAM pages.
+- If Process A writes to address `0x4000`, and Process B writes to address `0x4000`, they will never overwrite each other. They map to completely different physical hardware memory. Complete isolation.
 
 ---
 
-## 4. Process Creation & Transformation: `fork()` and `execve()`
+## 4. Process Creation: Bash Clones Itself (`fork` + `execve`)
 
-Processes in Unix-like operating systems do not materialize out of thin air. With the exception of `swapper` (PID 0) and `init` (PID 1) during machine boot, every single process is created through a standardized two-step lifecycle: **Cloning (`fork`)** followed by **Transformation (`execve`)**.
-
-### The Shell Execution Loop: Bash Cloning Itself
-When an engineer types a command into an interactive shell (e.g., `ls -l` in Bash):
-
-1. **Bash clones itself (`fork`):** Bash issues the `fork()` system call. The operating system creates an exact twin copy of the Bash process.
-2. **The Parent Waits:** The parent Bash process yields the CPU, calling `wait()` or `waitpid()`. It enters an interruptible sleep state (`TASK_INTERRUPTIBLE`), pausing until the child terminates.
-3. **The Child Wipes its Brain (`execve`):** The cloned child Bash process executes `execve("/usr/bin/ls", ...)`. It completely wipes out its inherited Bash code, data, and memory structures, loading the `/usr/bin/ls` binary into its address space.
-4. **Execution & Exit:** The newly loaded `ls` command runs, writes directory listings to stdout, and exits with a status code (e.g., `0`).
-5. **Wakeup & Reap:** The parent Bash process receives a `SIGCHLD` signal from the kernel, wakes up from `wait()`, harvests the child's exit code, reaps its entry from the process table, and presents a fresh shell prompt to the user.
+Processes don't just appear out of thin air. In Linux, brand new processes are born through a two-step ritual: **`fork()`** followed by **`execve()`**.
 
 ```
-       [ Parent: bash (PID 4000) ]
-                    |
-                    | calls fork()
-                    v
-  +-----------------+-----------------+
-  |                                   |
-  | returns PID 4001                  | returns 0
-  v                                   v
-[ Parent: bash (PID 4000) ]         [ Child: bash clone (PID 4001) ]
-  |                                   |
-  | calls wait()                      | calls execve("/usr/bin/ls")
-  | [ Enters Sleeping State ]         | [ Memory Wiped & Binary Loaded ]
-  |                                   v
-  |                                 [ Program: /bin/ls (PID 4001) ]
-  |                                   |
-  |                                   | runs & finishes
-  |                                   | calls exit(0)
-  |                                   v
-  |                                 [ Zombie State (PID 4001) ]
-  |                                   |
-  | receives SIGCHLD                  |
-  +<----------------------------------+
-  |
-  | reaps exit code (0)
-  v
-[ Parent: bash (PID 4000) ]
-(Displays next command prompt)
+[ Bash Shell (PID 4000) ]
+        │
+        ├── 1. Calls fork()
+        │      └── Clones itself into an exact twin!
+        │
+        ├── 2. Parent Bash goes to sleep (calls wait())
+        │
+[ Child Bash (PID 4001) ]
+        │
+        └── 3. Calls execve("/bin/ls")
+               └── Wipes its Bash brain, loads 'ls' binary, runs it!
 ```
 
-### Deep Dive: `fork()`
-- **Dual Return Values:** `fork()` is unique because it is called once, but **returns twice**:
-  - In the **Parent Process**, `fork()` returns the **PID of the newly created child** (a positive integer, e.g., `3721`). This allows the parent to track, monitor, or signal its offspring.
-  - In the **Child Process**, `fork()` returns **`0`**. This allows the process code to easily determine: *"I am the child; I must proceed with child duties or call execve."*
-  - If process creation fails (e.g., system PID limit reached), it returns `-1` to the parent.
-- **Copy-On-Write (COW):** Modern Linux does not physically copy all of the parent's RAM pages during `fork()`. Doing so would make spawning processes painfully slow. Instead, the kernel duplicates the page table entries and marks all memory pages as **read-only**. Only when either the parent or child attempts to *write* to a page does the MMU trigger a page fault, prompting the kernel to allocate and copy that specific 4 KB page.
+### 1. `fork()` — The Clone
+When you run a command in your terminal, the current Bash process literally **clones itself**:
+- `fork()` creates an exact replica child process.
+- It copies memory mappings (using **Copy-on-Write / COW**, so it doesn't waste RAM unless one of them writes to a page).
+- **The Dual Return Trick:** `fork()` is famous in Unix because it is called once, but **returns twice**:
+  - In the **parent**, `fork()` returns the **Child's PID** (e.g., `4001`) so the parent knows who its kid is.
+  - In the **child**, `fork()` returns **`0`** so the code can say: *"Hey, I'm the child, time to do my job."*
 
-### Deep Dive: `execve()`
-- **System Call Signature:**
-  ```c
-  int execve(const char *pathname, char *const argv[], char *const envp[]);
-  ```
-- **What `execve()` Does:**
-  - Deallocates and wipes the calling process's current code, data, heap, and stack segments.
-  - Loads the newly specified ELF executable binary into the address space.
-  - Sets the instruction pointer to the new program entry point (`main()`).
-  - **CRITICAL:** `execve()` does **NOT** create a new process. The PID and PPID remain completely unchanged!
-- **What Survives `execve()`:**
-  - **Open File Descriptors:** File descriptors remain open and valid across `execve()` unless explicitly marked with the `O_CLOEXEC` flag (or `FD_CLOEXEC`).
-  - **Environment Variables:** The `envp` array is passed to the new program image.
-  - **Process Identity:** PID, PPID, real/effective UID/GID, session ID, and working directory persist across the execution boundary.
+### 2. `execve()` — The Brain Wipe
+Now you have two Bash processes. But you didn't want two Bashes—you wanted to run `ls`!
+- The child process calls `execve()`.
+- What does `execve()` do? It **wipes the calling process's memory clean**. The Bash code, stack, and heap vanish, and the kernel loads the new program binary (`/bin/ls`) into that space.
+- **Key rule:** `execve()` does **NOT** create a new process! The PID stays exactly the same (`4001`). It just swaps the clothes and brain of the existing process.
+- What survives `execve()`? Environment variables and open file descriptors stay intact (unless `O_CLOEXEC` is set).
 
-### Demystifying the Raw Notes: "Child returns with 0. Parent returns value with 3721."
-A common point of confusion when studying operating systems is seeing return values listed under `execve()`:
-- **The Ambiguity:** In introductory study notes, engineers often jot down *"Child returns with 0. Parent returns value with 3721"* directly under `execve()`.
-- **The Systems Reality:**
-  1. **Those dual return values belong exclusively to `fork()`:** As detailed above, `fork()` is the syscall that is called once but returns twice — yielding `0` in the child process and the positive child PID (e.g. `3721`) in the parent process.
-  2. **`execve()` NEVER returns on success:** When `execve()` succeeds, the entire caller's code, stack, and heap are wiped and replaced with the new ELF executable. There is literally no original calling code left to return to! The CPU sets its program counter directly to the ELF entry point (`main()`) of the new binary.
-  3. **`execve()` ONLY returns on failure:** If and only if the kernel cannot execute the target binary (e.g., file not found `ENOENT`, permission denied `EACCES`, format error `ENOEXEC`), `execve()` returns `-1` to the caller and sets `errno`.
-  4. **The `0` in Child Lifecycle:** When the child program completes its job and calls `exit(0)`, the `0` represents its process termination status code, which the sleeping parent reaps via `wait()` / `waitpid()`.
+### Demystifying: *"Child returns with 0. Parent returns with 3721"*
+In introductory study notes, people often write:
+> *"Child returns with 0. Parent returns value with 3721."*
+
+Let's demystify what that actually means in the kernel:
+1. **Those return values belong to `fork()`, NOT `execve()`.**
+2. **`execve()` NEVER returns on success.** Why? Because your original code was wiped from memory! The CPU points its instruction pointer directly at the `main()` function of the new binary. `execve()` only returns if it *fails* (like file not found, returning `-1`).
+3. **The `0` at the end:** When the program finishes, it calls `exit(0)`. That `0` is the program's exit code, which the sleeping parent harvests when it wakes up.
 
 ---
 
-## 5. Visual Process Lifecycle Flowchart
+## 5. The Execution Loop (Visualized)
 
-The following Mermaid diagram maps the complete execution loop required by the POSIX model:  
-`Parent Process (Bash)` $\to$ `fork()` $\to$ `Parent sleeps / Child calls execve()` $\to$ `Program runs & exits` $\to$ `Parent wakes up via wait()`.
+Here is the exact lifecycle loop that happens every single time you hit `Enter` in your terminal:
 
 ```mermaid
 flowchart TD
-    %% Execution Loop Sequence
+    %% Execution Loop
     ParentBash["1. Parent Process: Bash<br>[PID: 4000]"] -->|"calls fork()"| SyscallFork{"Kernel: fork()"}
     
     %% Fork Branches
@@ -213,7 +137,7 @@ flowchart TD
     ChildClone -->|"calls execve('/bin/ls')"| ExecveTransition["3. Child calls execve()<br>Memory Wiped, Binary Loaded<br>PID 4001 Preserved"]
     
     %% Running and Exit
-    ExecveTransition -->|"starts execution"| ProgramRun["4. Program Runs & Exits<br>ls runs, writes output<br>calls exit(0)"]
+    ExecveTransition -->|"starts execution"| ProgramRun["4. Program Runs & Exits<br>ls runs, prints directory<br>calls exit(0)"]
     
     %% Zombie and Signal
     ProgramRun -->|"kernel frees memory"| ZombieState["Child Enters Zombie State<br>State: Z (EXIT_ZOMBIE)<br>Holds exit code 0"]
@@ -223,7 +147,7 @@ flowchart TD
     ParentSleep -->|"5. Parent wakes up via wait()<br>Harvests exit code (0)"| Reaped["Process Reaped<br>PID 4001 Freed from Table"]
     Reaped -->|"Ready for next command"| ParentBash
 
-    %% Theme-agnostic class styles for GitHub light and dark mode
+    %% Clean theme-agnostic styling
     classDef default fill:#f8fafc,stroke:#475569,stroke-width:1px,color:#0f172a;
     classDef highlight fill:#dbeafe,stroke:#2563eb,stroke-width:2px,color:#1e3a8a;
     classDef kernel fill:#f3e8ff,stroke:#9333ea,stroke-width:2px,color:#581c87;
@@ -238,625 +162,220 @@ flowchart TD
 
 ---
 
-## 6. PID 1: The Root Guardian & Orphan Management
+## 6. PID 1: The First Process & Guardian of Orphans
 
-When a Linux machine boots, the kernel mounts the root filesystem and directly executes the initial user-space program at `/sbin/init` (in modern distributions, a symlink to `systemd`). This process becomes **PID 1**.
+### What is PID 1?
+**PID 1 is the very first user-space process started by the Linux kernel at boot time.**
+When the Linux kernel finishes initializing hardware, it mounts the root filesystem and executes `/sbin/init` (which on modern systems is `systemd`). That process is assigned **PID 1**.
 
-```
-                           [ Kernel Boot ]
-                                  |
-                                  v
-                        [ PID 1: /sbin/init ]
-                           (systemd init)
-                                  |
-                +-----------------+-----------------+
-                |                                   |
-                v                                   v
-       [ sshd.service ]                    [ dbus.service ]
-                |
-                v
-       [ bash (PID 2100) ]
-                |
-                v (parent dies!)
-       [ orphan (PID 2150) ] ---------> (Reparented to PID 1 or Subreaper)
-```
+PID 1 is the ancestor of every other user process on the machine. But it also has two superpower responsibilities:
 
-### The Special Nature of PID 1
-PID 1 is fundamentally distinct from every other process running on the operating system:
-1. **Ancestral Root:** PID 1 is the great ancestor of every user-space process on the host.
-2. **Default Signal Immunity:** The Linux kernel treats signals sent to PID 1 with special handling. If PID 1 has not explicitly installed a handler for a signal, the kernel silently discards it—even fatal signals.
-3. **The Orphan Adoption Agency:** In a dynamic multi-tasking OS, parent processes may crash, segfault, or be killed while their children are still actively executing. 
+### 1. The Orphan Adoption Agency
+What happens if a parent process dies, crashes, or gets killed while its child process is still running?
+- That child is now an **orphan**.
+- Linux does **not** kill orphaned children.
+- Instead, the Linux kernel instantly steps in and **reparents** the orphan process. It assigns a new legal guardian: **PID 1** (or the nearest designated ancestor **subreaper**).
+- **Why?** Because when any process exits, its parent *must* read its exit status. PID 1 runs a continuous loop waiting for signals and reaps dead orphans immediately so they don't get stuck in limbo.
 
-### Orphan Processes & Automatic Reparenting
-- **What is an Orphan?** An orphan is a live, running process whose parent has terminated before the child exited.
-- **Linux Does Not Kill Orphans:** Unlike some naive operating systems, Linux never terminates a child simply because its parent died. Instead, the Linux kernel detects that the child's `PPID` is now dead and **automatically reparents the orphan process**.
-- **The Legal Guardian:** By default, the orphan is reparented to **PID 1** (or to the nearest designated ancestor **subreaper** defined via `prctl(PR_SET_CHILD_SUBREAPER, 1)`).
-- **Why Reparenting is Essential:** When an orphan eventually finishes execution and calls `exit()`, its exit status must be read by a parent. Because PID 1 continuously runs an asynchronous event loop that handles `SIGCHLD` and calls `waitpid(-1, &status, WNOHANG)`, PID 1 immediately reaps the orphan's exit status, preventing it from remaining a permanent zombie.
+### 2. Immunity to `sudo kill -9 1`
+Try running `sudo kill -9 1` on any Linux box. **Nothing happens.**
+- Normally, `SIGKILL` (signal 9) is uncatchable and fatal.
+- But inside the Linux kernel's signal dispatch code, there is a hardcoded rule: **signals sent to PID 1 are dropped unless PID 1 has explicitly registered a handler for them.**
+- Since `SIGKILL` cannot have a handler by definition, the kernel ignores it. This protects your entire operating system from immediately crashing if an admin makes a typo.
 
 ---
 
-## 7. Production & SRE Context: Containers, PID 1, and Host Exhaustion
+## 7. Production & SRE Reality: The Container PID 1 Trap
 
-In modern containerized environments (Docker, Podman, Kubernetes), container isolation is built using Linux **Namespaces** (PID, Mount, Network, IPC, UTS, User) and **Cgroups**.
+Now let's take these computer science fundamentals into the real world. Why should an SRE, DevOps engineer, or cloud developer care?
 
-### The Container PID 1 Trap
-When you launch a Docker container:
+Because when you run a container in Docker or Kubernetes:
 ```dockerfile
 FROM node:20-alpine
-WORKDIR /app
-COPY . .
 CMD ["node", "server.js"]
 ```
-Because the container runs inside a dedicated PID namespace, your application binary (`node server.js`) runs as **PID 1 of that container**!
+**`node server.js` runs as PID 1 inside that container's PID namespace!**
 
-Standard enterprise application runtimes (Node.js, Python, Java, Ruby, Go) were built to be web applications or services—**they were never engineered to be operating system init systems**. This mismatch triggers severe production failures:
+And here is the catch: Node.js, Python, and Java were built to serve web requests—**they were never built to act as an operating system init system.**
 
 ```
 +-------------------------------------------------------------------------+
 |                  CONTAINER PID NAMESPACE (WITHOUT INIT)                 |
 |                                                                         |
-|  [ PID 1: node server.js ]  <-- Does NOT reap zombies, ignores SIGTERM  |
-|         |                                                               |
-|         +-- Spawns worker script (PID 12)                               |
-|                  |                                                      |
-|                  +-- Spawns ffmpeg/child (PID 18)                       |
-|                           | (worker PID 12 crashes!)                    |
-|                           v                                             |
+|  [ PID 1: node server.js ]  <-- Doesn't reap zombies, ignores SIGTERM   |
+|         │                                                               |
+|         └── Spawns worker script (PID 12)                               |
+|                  │                                                      |
+|                  └── Spawns ffmpeg/child (PID 18)                       |
+|                           │ (worker PID 12 crashes!)                    |
+|                           ▼                                             |
 |              [ Orphan PID 18 reparents to PID 1 ]                       |
-|                           |                                             |
-|                           v (PID 18 exits)                              |
+|                           │                                             |
+|                           ▼ (PID 18 finishes & exits)                   |
 |              [ Zombie PID 18: <defunct> ]                               |
 |              [ Zombie PID 19: <defunct> ]  --> PERMANENT LEAK!          |
 |              [ Zombie PID 20: <defunct> ]                               |
 +-------------------------------------------------------------------------+
-                                    |
-            [ Leaks PIDs into Host Kernel PID Table ]
-                                    v
+                                    │
+            [ Leaks PIDs into the Host Kernel PID Table ]
+                                    ▼
           HOST OUTAGE: "fork: Resource temporarily unavailable"
 ```
 
-### Problem 1: Zombie Leaks & Host PID Exhaustion
-- If your containerized application spawns child processes (e.g., executing shell commands, image resizing utilities, or database dump tools) and those workers crash or orphan, the orphaned processes reparent to **PID 1 inside the container** (`node`).
-- Node.js does not run a background `waitpid(-1)` reap loop. 
-- When those orphaned children finish, they enter the `Z` (Zombie) state and remain stuck in the kernel's process table forever.
-- **The Catastrophic Host Outage:** While container memory or CPU may appear normal, each zombie consumes an entry in the Linux kernel's global process table. Linux limits maximum system PIDs via `/proc/sys/kernel/pid_max` (typically 32,768 or 4,194,304). As zombies accumulate inside unmonitored containers, the host kernel reaches its PID exhaustion ceiling. When that happens, **the entire host stops functioning**: no new SSH connections can be opened, monitoring agents crash, Kubernetes nodes become `NotReady`, and any `fork()` across the entire physical server fails with `EAGAIN: Resource temporarily unavailable`.
+### Disaster 1: Zombie Accumulation & Host PID Exhaustion
+- If your container app spawns sub-processes (e.g. running an image optimizer or shell utility) and intermediate processes die, those children reparent to **PID 1** inside the container (`node`).
+- Node.js doesn't run a background `waitpid()` reaper loop.
+- When those children exit, they become **Zombies (`<defunct>`)** and sit in the process table forever.
+- **The Host Blast Radius:** Containers share the host kernel. Linux has a global PID limit (`/proc/sys/kernel/pid_max`, often 32,768). Once zombie processes fill that table, **the entire physical server freezes**. No new SSH sessions, monitoring crashes, and any `fork()` fails with `EAGAIN: Resource temporarily unavailable`.
 
-### Problem 2: Signal Handling & Graceful Shutdown Failure
-- Under Linux signal semantics, PID 1 does not receive default signal handlers.
-- When an engineer or Kubernetes issues `docker stop <container>` or deletes a Pod, the container runtime sends **`SIGTERM` (signal 15)** to PID 1, granting it 10 seconds (by default) to drain active HTTP connections, commit transactions, and flush buffers.
-- If your app running as PID 1 has not explicitly registered a signal listener for `SIGTERM`, the kernel drops the signal entirely. Your application completely ignores the shutdown request!
-- After 10 seconds, Docker times out and issues a brutal **`SIGKILL` (signal 9)**. Your application is killed instantly, severing customer database transactions, corrupting write caches, and leaving external state broken.
+### Disaster 2: Graceful Shutdown Fails (The 10-Second Delay)
+- When Docker or Kubernetes wants to stop your container, it sends **`SIGTERM` (signal 15)** to PID 1.
+- Because PID 1 drops signals that don't have explicit listeners, your application might completely ignore `SIGTERM`.
+- Kubernetes waits 10 or 30 seconds, gives up, and sends a brutal **`SIGKILL` (signal 9)**.
+- Result: Customer database transactions get severed mid-flight, file caches get corrupted, and logs don't flush.
 
-### The Production SRE Solution: Init Wrappers
-To resolve this, SRE and production engineering best practices require placing a lightweight init wrapper as PID 1:
-
-1. **Docker Native Init Flag:** Pass `--init` to `docker run`:
-   ```bash
-   docker run --init -d -p 8080:8080 my-web-app:latest
-   ```
-2. **`tini` (Lightweight Init for Containers):**
+### The Fix: Init Wrappers
+Always use a lightweight init wrapper as your container's entrypoint:
+1. **Docker CLI:** Pass `--init` (`docker run --init ...`)
+2. **`tini`:**
    ```dockerfile
-   # Add Tini to your Dockerfile
-   ENV TINI_VERSION v0.19.0
-   ADD https://github.com/krallin/tini/releases/download/${TINI_VERSION}/tini /tini
-   RUN chmod +x /tini
    ENTRYPOINT ["/tini", "--"]
    CMD ["node", "server.js"]
    ```
-3. **`dumb-init` (Yelp's Container Init):**
+3. **`dumb-init`:**
    ```dockerfile
-   RUN apt-get update && apt-get install -y dumb-init
    ENTRYPOINT ["/usr/bin/dumb-init", "--"]
    CMD ["python3", "app.py"]
    ```
-
-**What Init Wrappers Guarantee in Production:**
-- **Proper Signal Forwarding:** When `SIGTERM` arrives, the wrapper forwards it to the entire process group, allowing worker processes to shut down gracefully.
-- **Asynchronous Zombie Reaping:** The wrapper registers a `SIGCHLD` handler that continuously calls `waitpid(-1, &status, WNOHANG)`, instantly reaping any orphaned child processes.
+Init wrappers do two things perfectly: they forward signals properly to your app, and they reap dead zombie children in the background.
 
 ---
 
-## 8. Critical Gotchas & Systems Edge Cases
+## 8. Edge Cases & Interview Gotchas
 
-Systems interviews, production outages, and security audits frequently hinge on understanding these three subtle Unix nuances:
+### Gotcha 1: File Descriptors Survive `execve()` by Default
+When `execve()` wipes a process's memory, you might think everything is gone. **Wrong.**
+- Open file descriptors (FDs) survive `execve()`!
+- If your parent process opened a database connection, a secret encryption key file, or a socket, and forgot to close it before executing another binary, that child binary **inherits open access to that file**.
+- **The Fix:** Always open files with the **`O_CLOEXEC`** flag (`open(path, O_RDONLY | O_CLOEXEC)`), or in Python 3.4+, file descriptors are set to `inheritable=False` by default.
 
-### Gotcha 1: `sudo kill -9 1` Immunity
-If an administrator executes:
-```bash
-sudo kill -9 1
-```
-**PID 1 does not die.** The system does not crash or reboot. Why?
-- `SIGKILL` (signal 9) and `SIGSTOP` cannot be caught, blocked, or ignored by regular processes.
-- However, inside the Linux kernel's signal dispatch implementation (`kernel/signal.c`), the kernel explicitly verifies whether the target process is the root `init` process (`PID == 1`).
-- The kernel will **only** deliver signals to PID 1 for which PID 1 has explicitly registered a custom signal handler. Because `SIGKILL` cannot have a custom handler by definition, the kernel silently drops the `SIGKILL` request from user-space. This prevents catastrophic operating system crashes caused by rogue scripts or accidental administrator typos.
+### Gotcha 2: Orphan vs. Zombie (The Showdown)
+People mix these up constantly. Here is the cheat sheet:
 
-### Gotcha 2: File Descriptors Survive `execve()` Unless `O_CLOEXEC` is Set
-- When a process calls `execve()`, its virtual memory (stack, heap, code) is completely wiped.
-- **However, open file descriptors (FDs) are preserved across `execve()` by default!**
-- **The Security & Stability Vulnerability:**
-  If a privileged parent process opens a sensitive database connection, an encryption keyfile, or an administrative Unix domain socket (e.g., FD 3), and subsequently executes an untrusted or non-privileged program without closing it, the child program inherits open access to FD 3!
-- **The Solution:** Always open file descriptors with the `O_CLOEXEC` flag (or toggle the `FD_CLOEXEC` descriptor flag via `fcntl`):
-  ```c
-  // C example ensuring file descriptor closes immediately upon execve()
-  int fd = open("/etc/secure.key", O_RDONLY | O_CLOEXEC);
-  ```
-  ```python
-  # Python 3.4+ sets O_CLOEXEC (inheritable=False) on all created file descriptors by default
-  import os
-  fd = os.open("/tmp/secure.dat", os.O_RDWR | os.O_CREAT | os.O_CLOEXEC)
-  ```
-
-### Gotcha 3: Orphan Process vs. Zombie Process
-Engineers often confuse orphans and zombies. They are opposite stages of the process lifecycle:
-
-| Comparative Dimension | Orphan Process | Zombie Process (`<defunct>`, State `Z`) |
+| Feature | Orphan Process | Zombie Process (`<defunct>`, State `Z`) |
 | :--- | :--- | :--- |
-| **Execution State** | **Alive and actively executing.** Consuming CPU cycles and RAM. | **Dead and finished.** Execution stopped; no code is running. |
-| **Memory Footprint** | Has full virtual memory space (code, heap, stack, maps). | **Zero memory.** Code, heap, and stack have been freed by kernel. |
-| **Parent Status** | Biological parent is **dead**. | Parent is **alive**, but hasn't called `wait()` / `waitpid()`. |
-| **Kernel Representation**| Active `task_struct` and full resource allocation. | Minimal `task_struct` entry in Process Table holding exit code. |
-| **Resolution** | Kernel reparents it to PID 1 or subreaper for guardianship. | Cleared when parent calls `wait()`, or when parent dies. |
-| **Can you kill it?** | Yes, via `kill <PID>` like any normal running process. | **No.** You cannot kill a zombie; it is already dead (`kill -9` does nothing). |
+| **Is it alive?** | **YES.** Running code, using CPU and RAM. | **NO.** It's dead. Execution stopped. |
+| **Memory Footprint** | Has full virtual memory (code, heap, stack). | **Zero.** Memory was already freed by the kernel. |
+| **Parent Status** | Original parent is **dead**. | Parent is **alive**, but forgot to call `wait()`. |
+| **What happens?** | Kernel reparents it to PID 1 / subreaper. | Sits in the process table holding its exit code. |
+| **Can you kill it?** | Yes, with `kill <PID>`. | **No.** You can't kill what's already dead (`kill -9` does nothing). |
 
 ---
 
-## 9. Hands-On Terminal Lab & Proof of Work
+## 9. Terminal Lab: Proving It in Real Time
 
-The following section contains tested, reproducible experiments performed in an authentic Linux environment (Ubuntu 26.04 LTS / Linux Kernel 6.6+).
+Everything above is grounded in real experiments. You can run all of these yourself from the [`lab/`](./lab) directory in this repo:
 
-```
-================================================================================
-LAB WORKSPACE OVERVIEW
-Repository Directory : scratch/day-01-linux-processes/lab/
-Lab Script 1         : inspect_proc.sh (Direct /proc inspection & FD tracking)
-Lab Script 2         : orphan_demo.py (Forking, child PID return & reparenting)
-Lab Script 3         : fd_cloexec_demo.py (FD inheritance & O_CLOEXEC verification)
-================================================================================
-```
+### Experiment 1: Peeking Inside `/proc`
+In Linux, `/proc` isn't real disk storage; it's a window directly into the kernel's memory.
 
-### Lab 1: Direct Inspection of `/proc` Filesystem
-The `/proc` virtual filesystem is the window directly into the Linux kernel's internal process tables. 
-
-#### Reproducible Inspection Script (`inspect_proc.sh`)
-```bash
-#!/bin/bash
-# inspect_proc.sh - Inspecting Linux Process Anatomy via /proc
-
-echo "=========================================="
-echo "   PROCESS INSPECTION LAB (PID: $$)       "
-echo "=========================================="
-
-echo -e "\n[1] Command Line (/proc/$$/cmdline):"
-cat /proc/$$/cmdline | tr '\0' ' '
-echo ""
-
-echo -e "\n[2] Key Process Attributes (/proc/$$/status):"
-grep -E '^(Name|State|Tgid|Pid|PPid|Uid|Gid|FDSize|VmSize|VmRSS|Threads):' /proc/$$/status
-
-echo -e "\n[3] Open File Descriptors (/proc/$$/fd):"
-ls -la /proc/$$/fd
-
-echo -e "\n[4] Virtual Address Space Mapping (/proc/$$/maps - First 5 entries):"
-head -n 5 /proc/$$/maps
-```
-
-#### Actual Terminal Execution Output
+Run [`lab/inspect_proc.sh`](./lab/inspect_proc.sh):
 ```console
-$ bash lab/inspect_proc.sh
+$ ./lab/inspect_proc.sh
 ==========================================
-   PROCESS INSPECTION LAB (PID: 4250)       
+   PROCESS INSPECTION LAB (PID: 5702)       
 ==========================================
 
-[1] Command Line (/proc/4250/cmdline):
-bash lab/inspect_proc.sh 
+[1] Command Line (/proc/5702/cmdline):
+/bin/bash ./lab/inspect_proc.sh 
 
-[2] Key Process Attributes (/proc/4250/status):
-Name:	bash
+[2] Key Process Attributes (/proc/5702/status):
+Name:	inspect_proc.sh
 State:	S (sleeping)
-Tgid:	4250
-Pid:	4250
-PPid:	4249
+Pid:	5702
+PPid:	5700
 Uid:	1000	1000	1000	1000
 Gid:	1000	1000	1000	1000
 FDSize:	256
 VmSize:	    4948 kB
-VmRSS:	    3680 kB
-Threads:	1
+VmRSS:	    3684 kB
 
-[3] Open File Descriptors (/proc/4250/fd):
-total 0
-dr-x------ 2 abir abir  6 Sep 11 03:38 .
-dr-xr-xr-x 9 abir abir  0 Sep 11 03:38 ..
-lr-x------ 1 abir abir 64 Sep 11 03:38 0 -> pipe:[26056]
-l-wx------ 1 abir abir 64 Sep 11 03:38 1 -> pipe:[26057]
-l-wx------ 1 abir abir 64 Sep 11 03:38 2 -> pipe:[26058]
-lrwx------ 1 abir abir 64 Sep 11 03:38 7 -> /dev/ptmx
-lrwx------ 1 abir abir 64 Sep 11 03:38 10 -> /dev/ptmx
-lr-x------ 1 abir abir 64 Sep 11 03:38 255 -> /mnt/c/Users/pc/.gemini/antigravity/scratch/day-01-linux-processes/lab/inspect_proc.sh
-
-[4] Virtual Address Space Mapping (/proc/4250/maps - First 5 entries):
-5dd78685f000-5dd786890000 r--p 00000000 08:30 1503                       /usr/bin/bash
-5dd786890000-5dd786993000 r-xp 00031000 08:30 1503                       /usr/bin/bash
-5dd786993000-5dd7869ca000 r--p 00134000 08:30 1503                       /usr/bin/bash
-5dd7869ca000-5dd7869ce000 r--p 0016b000 08:30 1503                       /usr/bin/bash
-5dd7869ce000-5dd7869d7000 rw-p 0016f000 08:30 1503                       /usr/bin/bash
+[3] Open File Descriptors (/proc/5702/fd):
+lr-x------ 1 abir abir 64 Sep 11 03:49 0 -> pipe:[34388]
+l-wx------ 1 abir abir 64 Sep 11 03:49 1 -> pipe:[34389]
+l-wx------ 1 abir abir 64 Sep 11 03:49 2 -> pipe:[34390]
+lr-x------ 1 abir abir 64 Sep 11 03:49 255 -> ./lab/inspect_proc.sh
 ```
 
 ---
 
-### Lab 2: Process Creation, Forking, and Orphan Reparenting
-This experiment demonstrates process cloning with `os.fork()`, observes parent PID return values, lets the parent terminate prematurely, and verifies that the Linux kernel reparents the live orphan to a guardian subreaper / PID 1.
+### Experiment 2: Watching an Orphan Get Adopted
+In [`lab/orphan_demo.py`](./lab/orphan_demo.py), a parent process forks a child, prints the child PID, and intentionally terminates immediately without calling `wait()`. Watch what the kernel does:
 
-#### Verification Script (`orphan_demo.py`)
-```python
-#!/usr/bin/env python3
-"""
-orphan_demo.py - Process Creation, Forking, and Orphan Reparenting in Python
-Demonstrates:
-  1. Process creation via os.fork()
-  2. Fork return values (Child PID to parent, 0 to child)
-  3. Premature parent termination leaving the child orphaned
-  4. Automatic kernel reparenting to adoptive guardian (PID 1 or Subreaper)
-  5. Synchronous supervisor coordination to ensure clean terminal output
-"""
-import os
-import sys
-import time
-
-def read_kernel_ppid(pid: int) -> int:
-    """Read true PPid directly from kernel via /proc/<pid>/status."""
-    try:
-        with open(f"/proc/{pid}/status", "r") as f:
-            for line in f:
-                if line.startswith("PPid:"):
-                    return int(line.split()[1])
-    except (FileNotFoundError, IndexError, ValueError):
-        pass
-    return os.getppid()
-
-def read_comm_name(pid: int) -> str:
-    """Read process name directly from /proc/<pid>/comm."""
-    try:
-        with open(f"/proc/{pid}/comm", "r") as f:
-            return f.read().strip()
-    except (FileNotFoundError, PermissionError):
-        return "system/guardian"
-
-def run_experiment():
-    supervisor_pid = os.getpid()
-    print("=" * 65)
-    print(f"[*] [Supervisor: {supervisor_pid}] Starting process lifecycle experiment")
-    print("=" * 65)
-    sys.stdout.flush()
-
-    # Pipe for synchronizing Child PID to Supervisor
-    r_pipe, w_pipe = os.pipe()
-
-    # Step 1: Supervisor forks Parent Worker
-    parent_worker_pid = os.fork()
-
-    if parent_worker_pid == 0:
-        # Inside Worker Parent
-        os.close(r_pipe)
-        p_pid = os.getpid()
-        print(f"[*] [Parent:     {p_pid}] Worker Parent running. Calling os.fork() to spawn child...")
-        sys.stdout.flush()
-
-        child_pid = os.fork()
-
-        if child_pid == 0:
-            # Inside Child
-            c_pid = os.getpid()
-            bio_ppid = os.getppid()
-            bio_name = read_comm_name(bio_ppid)
-            print(f"[+] [Child:      {c_pid}] Child created! Biological Parent PPID: {bio_ppid} ('{bio_name}')")
-            sys.stdout.flush()
-
-            # Pass child PID to supervisor
-            os.write(w_pipe, f"{c_pid}\n".encode())
-            os.close(w_pipe)
-
-            # Wait for biological parent to terminate
-            print(f"[+] [Child:      {c_pid}] Waiting for Biological Parent ({bio_ppid}) to terminate...")
-            sys.stdout.flush()
-            while os.path.exists(f"/proc/{bio_ppid}"):
-                time.sleep(0.05)
-
-            # Allow kernel reparenting lock to settle
-            time.sleep(0.2)
-
-            adoptive_ppid = os.getppid()
-            adoptive_name = read_comm_name(adoptive_ppid)
-            print("-" * 65)
-            print(f"[!] [Child:      {c_pid}] Biological Parent died! Querying kernel for new PPID...")
-            print(f"[!] [Child:      {c_pid}] Adoptive Parent PPID: {adoptive_ppid}")
-            print(f"[!] [Child:      {c_pid}] Guardian Name: '{adoptive_name}' (PID: {adoptive_ppid})")
-            print("=" * 65)
-            sys.stdout.flush()
-            sys.exit(0)
-        else:
-            # Inside Worker Parent: exit immediately without waiting for Child
-            print(f"[+] [Parent:     {p_pid}] fork() returned Child PID: {child_pid}")
-            print(f"[+] [Parent:     {p_pid}] Parent will now EXIT IMMEDIATELY without calling wait().")
-            print(f"[+] [Parent:     {p_pid}] Child {child_pid} is now an orphan!")
-            sys.stdout.flush()
-            sys.exit(0)
-
-    # Inside Supervisor:
-    os.close(w_pipe)
-    # Wait for Parent Worker to exit
-    _, status = os.waitpid(parent_worker_pid, 0)
-    print(f"[*] [Supervisor: {supervisor_pid}] Observed Worker Parent {parent_worker_pid} exit cleanly.")
-    sys.stdout.flush()
-
-    # Read child PID from pipe
-    child_line = os.read(r_pipe, 128).decode().strip()
-    os.close(r_pipe)
-
-    if child_line:
-        child_pid = int(child_line)
-        # Wait for orphan child to finish execution before returning shell prompt
-        while os.path.exists(f"/proc/{child_pid}"):
-            time.sleep(0.05)
-
-    print(f"[*] [Supervisor: {supervisor_pid}] Experiment completed successfully.")
-
-if __name__ == "__main__":
-    run_experiment()
-```
-
-#### Actual Terminal Execution Output
 ```console
 $ python3 lab/orphan_demo.py
 =================================================================
-[*] [Supervisor: 4934] Starting process lifecycle experiment
+[*] [Supervisor: 5718] Starting process lifecycle experiment
 =================================================================
-[*] [Parent:     4941] Worker Parent running. Calling os.fork() to spawn child...
-[+] [Parent:     4941] fork() returned Child PID: 4942
-[+] [Parent:     4941] Parent will now EXIT IMMEDIATELY without calling wait().
-[+] [Parent:     4941] Child 4942 is now an orphan!
-[+] [Child:      4942] Child created! Biological Parent PPID: 4941 ('python3')
-[+] [Child:      4942] Waiting for Biological Parent (4941) to terminate...
-[*] [Supervisor: 4934] Observed Worker Parent 4941 exit cleanly.
+[*] [Parent:     5725] Worker Parent running. Calling os.fork() to spawn child...
+[+] [Parent:     5725] fork() returned Child PID: 5726
+[+] [Parent:     5725] Parent will now EXIT IMMEDIATELY without calling wait().
+[+] [Parent:     5725] Child 5726 is now an orphan!
+[+] [Child:      5726] Child created! Biological Parent PPID: 5725 ('python3')
+[+] [Child:      5726] Waiting for Biological Parent (5725) to terminate...
+[*] [Supervisor: 5718] Observed Worker Parent 5725 exit cleanly.
 -----------------------------------------------------------------
-[!] [Child:      4942] Biological Parent died! Querying kernel for new PPID...
-[!] [Child:      4942] Adoptive Parent PPID: 4933
-[!] [Child:      4942] Guardian Name: 'Relay(4934)' (PID: 4933)
+[!] [Child:      5726] Biological Parent died! Querying kernel for new PPID...
+[!] [Child:      5726] Adoptive Parent PPID: 5717
+[!] [Child:      5726] Guardian Name: 'Relay(5718)' (PID: 5717)
 =================================================================
-[*] [Supervisor: 4934] Experiment completed successfully.
+[*] [Supervisor: 5718] Experiment completed successfully.
 ```
+> **What happened here?** The child started with parent `PID 5725`. As soon as the biological parent died, the Linux kernel dynamically reassigned the child's PPID to guardian `PID 5717` (the active system subreaper). The orphan was adopted in real time!
 
 ---
 
-### Lab 2b: Pure Bash Orphan Reparenting & The `$PPID` Trap (`orphan_demo.sh`)
+### Experiment 3: Proving File Descriptor Leaks & `O_CLOEXEC`
+In [`lab/fd_cloexec_demo.py`](./lab/fd_cloexec_demo.py), we open two file descriptors: FD 3 without `O_CLOEXEC`, and FD 4 with `O_CLOEXEC`. Then we call `execve()` to replace our entire memory with `/bin/ls -l /proc/self/fd`:
 
-#### Verification Script (`orphan_demo.sh`)
-```bash
-#!/bin/bash
-# orphan_demo.sh - Demonstrating Process Forking and Orphan Reparenting in Pure Bash
-
-set -e
-
-TMP_DIR=$(mktemp -d /tmp/orphan_lab.XXXXXX)
-trap 'rm -rf "${TMP_DIR}"' EXIT
-
-CHILD_READY="${TMP_DIR}/child_ready"
-CHILD_DONE="${TMP_DIR}/child_done"
-CHILD_PID_FILE="${TMP_DIR}/child_pid"
-
-SUPERVISOR_PID=$$
-echo "[*] [Supervisor: ${SUPERVISOR_PID}] Initializing experiment..."
-
-# Launch Worker Parent in background
-(
-    WORKER_PID=$$
-    echo "[*] [Parent:     ${WORKER_PID}] Worker Parent running. Forking child..."
-    
-    # Spawn Child subshell
-    (
-        CHILD_PID=$BASHPID
-        echo "${CHILD_PID}" > "${CHILD_PID_FILE}"
-        
-        # Read biological parent PID directly from kernel /proc
-        BIO_PPID=$(awk '/^PPid:/ {print $2}' "/proc/${CHILD_PID}/status")
-        BIO_NAME=$(cat "/proc/${BIO_PPID}/comm" 2>/dev/null || echo "bash")
-        
-        echo "[+] [Child:      ${CHILD_PID}] Child running! Biological Parent PPID: ${BIO_PPID} ('${BIO_NAME}')"
-        
-        # Signal Worker Parent that Child has recorded biological parent
-        touch "${CHILD_READY}"
-        
-        echo "[+] [Child:      ${CHILD_PID}] Waiting for biological parent (${BIO_PPID}) to exit..."
-        while [ -d "/proc/${BIO_PPID}" ]; do
-            sleep 0.05
-        done
-        
-        # Brief pause for kernel reparenting to complete
-        sleep 0.2
-        
-        # Query new adoptive parent PID from kernel
-        ADOPTIVE_PPID=$(awk '/^PPid:/ {print $2}' "/proc/${CHILD_PID}/status")
-        GUARDIAN_NAME=$(cat "/proc/${ADOPTIVE_PPID}/comm" 2>/dev/null || echo "guardian")
-        
-        echo "------------------------------------------------------------"
-        echo "[!] [Child:      ${CHILD_PID}] Biological parent terminated! Querying kernel for new PPID..."
-        echo "[!] [Child:      ${CHILD_PID}] Adoptive Parent PPID: ${ADOPTIVE_PPID}"
-        echo "[!] [Child:      ${CHILD_PID}] Guardian Name: '${GUARDIAN_NAME}' (PID: ${ADOPTIVE_PPID})"
-        echo "============================================================"
-        touch "${CHILD_DONE}"
-    ) &
-    
-    CHILD_JOB_PID=$!
-    
-    # Wait until Child signals that it is ready and recorded BIO_PPID
-    while [ ! -f "${CHILD_READY}" ]; do
-        sleep 0.02
-    done
-    
-    echo "[+] [Parent:     ${WORKER_PID}] Child is ready (PID: ${CHILD_JOB_PID})."
-    echo "[+] [Parent:     ${WORKER_PID}] Parent exiting now without waiting for Child!"
-    echo "[+] [Parent:     ${WORKER_PID}] Child ${CHILD_JOB_PID} is now an orphan."
-    exit 0
-) &
-
-PARENT_JOB_PID=$!
-wait "${PARENT_JOB_PID}" 2>/dev/null || true
-echo "[*] [Supervisor: ${SUPERVISOR_PID}] Observed Worker Parent (PID ${PARENT_JOB_PID}) exit."
-
-# Wait for Child to complete its demonstration
-while [ ! -f "${CHILD_DONE}" ]; do
-    sleep 0.05
-done
-
-echo "[*] [Supervisor: ${SUPERVISOR_PID}] Experiment completed successfully."
-```
-
-#### Actual Terminal Execution Output
-```console
-$ bash lab/orphan_demo.sh
-============================================================
-   BASH ORPHAN REPARENTING LAB (Pure Bash & /proc)          
-============================================================
-[*] [Supervisor: 5437] Initializing experiment...
-[*] [Parent:     5437] Worker Parent running. Forking child...
-[+] [Child:      5440] Child running! Biological Parent PPID: 5439 ('bash')
-[+] [Child:      5440] Waiting for biological parent (5439) to exit...
-[+] [Parent:     5437] Child is ready (PID: 5440).
-[+] [Parent:     5437] Parent exiting now without waiting for Child!
-[+] [Parent:     5437] Child 5440 is now an orphan.
-[*] [Supervisor: 5437] Observed Worker Parent (PID 5439) exit.
-------------------------------------------------------------
-[!] [Child:      5440] Biological parent terminated! Querying kernel for new PPID...
-[!] [Child:      5440] Adoptive Parent PPID: 5436
-[!] [Child:      5440] Guardian Name: 'Relay(5437)' (PID: 5436)
-============================================================
-[*] [Supervisor: 5437] Experiment completed successfully.
-```
-
-> **Deep-Dive Systems Analysis:**
-> 1. **The Biological Parent Exit:** When Parent `PID 4941` / `PID 5439` terminated without calling `wait()`, the child became an orphan. In traditional operating systems, children might terminate or get lost; in Linux, the kernel's process scheduler instantly intercepts the orphaned child's `task_struct`.
-> 2. **Subreaper vs. Root PID 1:** Why did the child reparent to `Relay` (`PID 4933` / `PID 5436`) instead of `PID 1` (`systemd`)?  
->    In modern Linux systems, ancestor processes can register as an official **child subreaper** using `prctl(PR_SET_CHILD_SUBREAPER, 1)`. When a process becomes an orphan, the kernel walks up the process tree looking for the nearest ancestor marked as a subreaper. WSL2 uses a background relay subreaper daemon (`Relay`), while systemd desktop sessions run user managers (`systemd --user`). If no subreaper is registered along the ancestry tree (such as inside standard minimalist container namespaces), the orphan reparents directly to system root **PID 1**.
-> 3. **The Static Bash `$PPID` Trap:** Many engineers mistakenly write `echo $PPID` in Bash scripts to detect orphan reparenting. However, Bash initializes `$PPID` once as a static read-only variable upon shell invocation. It never re-queries the kernel! To detect dynamic kernel reparenting in Bash, one MUST query `/proc/$BASHPID/status` (`PPid:` line), which directly reads the live `task_struct` inside the Linux kernel.
-
----
-
-### Lab 3: Proving File Descriptor Survival & `O_CLOEXEC` across `execve()`
-This lab verifies that file descriptors without `O_CLOEXEC` leak across an `execve()` boundary into the new binary, whereas descriptors marked with `O_CLOEXEC` are closed automatically by the kernel.
-
-#### Verification Script (`fd_cloexec_demo.py`)
-```python
-#!/usr/bin/env python3
-"""
-fd_cloexec_demo.py - Demonstrating File Descriptor survival across execve()
-"""
-import os
-import sys
-
-def main():
-    print("==================================================")
-    print("   FILE DESCRIPTOR INHERITANCE ACROSS EXECVE()    ")
-    print("==================================================")
-
-    # 1. Open a file WITHOUT O_CLOEXEC (inheritable across execve)
-    fd_leaked = os.open("/tmp/leaked_secret.txt", os.O_CREAT | os.O_RDWR)
-    os.set_inheritable(fd_leaked, True)
-
-    # 2. Open a file WITH O_CLOEXEC (not inheritable across execve)
-    fd_cloexec = os.open("/tmp/closed_secret.txt", os.O_CREAT | os.O_RDWR)
-    os.set_inheritable(fd_cloexec, False)
-
-    print(f"Parent Process PID: {os.getpid()}")
-    print(f"FD {fd_leaked} -> /tmp/leaked_secret.txt (Inheritable: {os.get_inheritable(fd_leaked)})")
-    print(f"FD {fd_cloexec} -> /tmp/closed_secret.txt (Inheritable: {os.get_inheritable(fd_cloexec)})")
-    print("\nCalling os.execve() to replace memory with '/bin/ls -l /proc/self/fd'...")
-    sys.stdout.flush()
-
-    # Replace current process memory with ls
-    os.execv("/bin/ls", ["ls", "-l", "/proc/self/fd"])
-
-if __name__ == "__main__":
-    main()
-```
-
-#### Actual Terminal Execution Output
 ```console
 $ python3 lab/fd_cloexec_demo.py
 ==================================================
    FILE DESCRIPTOR INHERITANCE ACROSS EXECVE()    
 ==================================================
-Parent Process PID: 4373
+Parent process PID: 5751
 FD 3 -> /tmp/leaked_secret.txt (Inheritable: True)
 FD 4 -> /tmp/closed_secret.txt (Inheritable: False)
 
 Calling os.execve() to replace memory with '/bin/ls -l /proc/self/fd'...
 total 0
-lr-x------ 1 abir abir 64 Sep 11 03:39 0 -> pipe:[27398]
-l-wx------ 1 abir abir 64 Sep 11 03:39 1 -> pipe:[27399]
-l-wx------ 1 abir abir 64 Sep 11 03:39 2 -> pipe:[27400]
-lrwx------ 1 abir abir 64 Sep 11 03:39 3 -> /tmp/leaked_secret.txt
-lr-x------ 1 abir abir 64 Sep 11 03:39 4 -> /proc/4373/fd
-lrwx------ 1 abir abir 64 Sep 11 03:39 7 -> /dev/ptmx
-lrwx------ 1 abir abir 64 Sep 11 03:39 10 -> /dev/ptmx
+lr-x------ 1 abir abir 64 Sep 11 03:49 0 -> pipe:[38018]
+l-wx------ 1 abir abir 64 Sep 11 03:49 1 -> pipe:[38019]
+l-wx------ 1 abir abir 64 Sep 11 03:49 2 -> pipe:[38020]
+lrwx------ 1 abir abir 64 Sep 11 03:49 3 -> /tmp/leaked_secret.txt
+lr-x------ 1 abir abir 64 Sep 11 03:49 4 -> /proc/5751/fd
 ```
-> **Proof:** When `/bin/ls` executes under PID 4373, **FD 3 remains open and pointed directly at `/tmp/leaked_secret.txt`**, demonstrating that unflagged file descriptors leak across `execve()`. Meanwhile, **FD 4 was closed automatically** by the kernel upon `execve()`, and was reused by `ls` to read the directory itself.
+Look at that output: **FD 3 survived the `execve()` brain wipe!** FD 4 was safely closed. That's `O_CLOEXEC` in action.
 
 ---
 
-### Lab 4: Proving PID 1 Immunity against `kill -9 1`
-This terminal experiment tests what happens when root attempts to kill PID 1 (`systemd`).
+## 10. Quick Engineering Cheat Sheet
 
-#### Terminal Command & Real Output
-```console
-$ sudo kill -9 1
-$ echo "Exit Status: $?"
-Exit Status: 0
-
-$ ps -p 1 -o pid,stat,comm
-    PID STAT COMMAND
-      1 Ss   systemd
-```
-> **Proof:** Even though root issued `kill -9 1` and the syscall completed with exit code 0, `systemd` (PID 1) is still running in state `Ss`. The Linux kernel silently discarded the `SIGKILL` to protect operating system stability.
+| Command | What it does |
+| :--- | :--- |
+| `pstree -p -u` | Visual tree of all parent-child relationships and PIDs |
+| `ps -eo pid,ppid,stat,comm` | List all processes with their states (`R`, `S`, `Z`) |
+| `ps -eo pid,ppid,stat,comm \| grep -w 'Z'` | Find every zombie process on the host |
+| `cat /proc/sys/kernel/pid_max` | Check your system's global PID ceiling |
+| `ls -la /proc/<PID>/fd/` | View every open file descriptor for a process |
+| `tr '\0' ' ' < /proc/<PID>/cmdline` | Inspect the exact arguments used to launch any process |
 
 ---
 
-## 10. Systems Engineer Reference & Cheat Sheet
+## Summary & What's Next
+Understanding processes, virtual memory isolation, and PID 1 isn't just academic theory—it is the bedrock of container security, troubleshooting memory leaks, and building bulletproof production systems.
 
-### Essential CLI Commands
+On **Day 2**, we'll dive deeper into Linux signals, IPC (Inter-Process Communication), and memory allocation mechanics.
 
-```bash
-# 1. View process tree with PIDs and ownership
-pstree -p -u
-
-# 2. Detailed process inspection showing PID, PPID, State, Command
-ps -eo pid,ppid,stat,user,%cpu,%mem,comm
-
-# 3. Locate all zombie processes currently on the host
-ps -eo pid,ppid,stat,comm | grep -w 'Z'
-
-# 4. Check system-wide maximum PID ceiling
-cat /proc/sys/kernel/pid_max
-
-# 5. Inspect open file descriptors for a specific PID
-ls -la /proc/<PID>/fd/
-
-# 6. Read command line arguments as null-delimited strings
-tr '\0' ' ' < /proc/<PID>/cmdline; echo
-
-# 7. Check memory usage and virtual address space mappings
-cat /proc/<PID>/status | grep -E '^(VmSize|VmRSS|Threads):'
-```
-
-### Core System Call Summary
-
-| Syscall | Purpose | Signature / Crucial Parameter |
-| :--- | :--- | :--- |
-| **`fork()`** | Clones caller process. Returns 0 to child, child PID to parent. | `pid_t fork(void);` |
-| **`execve()`** | Replaces memory space with new binary without changing PID. | `int execve(const char *path, char *const argv[], char *const envp[]);` |
-| **`waitpid()`** | Pauses caller until specified child process changes state / exits. | `pid_t waitpid(pid_t pid, int *status, int options);` |
-| **`exit()`** | Terminates caller, yields status code, turns process into zombie until reaped. | `void exit(int status);` |
-| **`prctl()`** | Configures process controls, such as registering as a child subreaper. | `prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);` |
-
----
-
-*Document created as part of the Systems & Linux Engineering Mastery Series.*
+*Got thoughts or questions? Check out the repo and run the labs yourself!*  
+👉 **GitHub:** [isswansalty-tech/day-01-linux-processes](https://github.com/isswansalty-tech/day-01-linux-processes)
