@@ -245,23 +245,4 @@ Testing `SIGKILL` directly against PID 1 as root:
 ```
 
 **What this showed:**
-- Even running as root (`UID 0`), `SIGKILL` sent to PID 1 was silently discarded by the kernel. PID 1 stayed alive in state `Ss`.
-
----
-
-## Lab Scripts
-
-| Script | Language | Description |
-| :--- | :--- | :--- |
-| [`lab/inspect_proc.sh`](./lab/inspect_proc.sh) | Bash | Direct inspection of `/proc` (`status`, `cmdline`, `fd`, `maps`). |
-| [`lab/orphan_demo.py`](./lab/orphan_demo.py) | Python | Demonstrates `fork()`, parent exit, and kernel orphan reparenting. |
-| [`lab/orphan_demo.sh`](./lab/orphan_demo.sh) | Bash | Pure Bash orphan reparenting test using `/proc/$BASHPID/status`. |
-| [`lab/fd_cloexec_demo.py`](./lab/fd_cloexec_demo.py) | Python | Demonstrates FD survival across `execve()` and `O_CLOEXEC` behavior. |
-
-```bash
-chmod +x lab/*.sh lab/*.py
-./lab/inspect_proc.sh
-python3 lab/orphan_demo.py
-bash lab/orphan_demo.sh
-python3 lab/fd_cloexec_demo.py
-```
+- Even running as root (`UID 0`), `SIGKILL` sent to PID 1 was silently discarded by the kernel. PID 1 stayed alive (state `Ss`).
